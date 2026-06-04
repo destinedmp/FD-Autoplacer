@@ -38,6 +38,7 @@ import numpy as np
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 
     HAS_TORCH = True
 except ImportError:
@@ -265,7 +266,7 @@ class PlacerModel(nn.Module):
             total = total + w * wl
         return total
 
-    def overlap(self, slop: float = 0.3) -> torch.Tensor:
+    def overlap(self, slop: float = 0.3, beta: float = 2.0) -> torch.Tensor:
         """Pairwise AABB overlap area with rotation-aware bounding boxes.
 
         For a rectangle (hx, hy) rotated by θ the axis-aligned half-extents are:
@@ -273,20 +274,27 @@ class PlacerModel(nn.Module):
             Hx = |hx·cosθ| + |hy·sinθ|
             Hy = |hx·sinθ| + |hy·cosθ|
         """
+        # Add tiny jitter to break exact duplicates/symmetry at dx = 0 or dy = 0
+        X_jit = self.X + torch.randn_like(self.X) * 1e-4
+        Y_jit = self.Y + torch.randn_like(self.Y) * 1e-4
+
         ct = torch.cos(self.Theta).abs()
         st = torch.sin(self.Theta).abs()
         hx = self.p.half_sizes[:, 0] * ct + self.p.half_sizes[:, 1] * st
         hy = self.p.half_sizes[:, 0] * st + self.p.half_sizes[:, 1] * ct
 
         # Pairwise separations (N, N)
-        dx = (self.X.unsqueeze(1) - self.X.unsqueeze(0)).abs()
-        dy = (self.Y.unsqueeze(1) - self.Y.unsqueeze(0)).abs()
+        dx = (X_jit.unsqueeze(1) - X_jit.unsqueeze(0)).abs()
+        dy = (Y_jit.unsqueeze(1) - Y_jit.unsqueeze(0)).abs()
 
         # Required clearance
         sx = hx.unsqueeze(1) + hx.unsqueeze(0) + slop
         sy = hy.unsqueeze(1) + hy.unsqueeze(0) + slop
 
-        area = torch.relu(sx - dx) * torch.relu(sy - dy)
+        # Use softplus instead of relu for smooth gradients
+        ox = F.softplus(beta * (sx - dx)) / beta
+        oy = F.softplus(beta * (sy - dy)) / beta
+        area = ox * oy
         return area[self.p._triu].sum()
 
     def boundary(self) -> torch.Tensor:
@@ -334,7 +342,7 @@ class PlacerModel(nn.Module):
 
     def forward(self, w: dict) -> tuple[torch.Tensor, dict]:
         L_w = self.wirelength(gamma=w.get("gamma", 5.0))
-        L_o = self.overlap()
+        L_o = self.overlap(beta=w.get("beta", 2.0))
         L_b = self.boundary()
         L_r = self.orient()
         L_d = self.decoup_loss()
@@ -397,7 +405,7 @@ def run_gpu_placement(
     model = PlacerModel(prob, components)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, n_iters, eta_min=lr * 0.01
+        opt, n_iters, eta_min=lr * 0.2
     )
 
     n_signal = sum(1 for n in prob.nets if not n["power"])
@@ -419,11 +427,13 @@ def run_gpu_placement(
         p = it / n_iters
 
         # Annealing schedule
+        beta = 1.0 + 4.0 * p  # Anneal beta from 1.0 to 5.0 to harden boundaries
         w = {
             "gamma": max(1.0, 10.0 * (1 - p)),  # tighten LSE approximation
+            "beta": beta,
             "wl": 1.0,
-            "ov": 10.0 + 300.0 * p**2,  # ramp up overlap penalty
-            "bd": 50.0 + 300.0 * p,  # ramp up boundary penalty
+            "ov": 10.0 + 350.0 * p**2,  # ramp up overlap penalty
+            "bd": 50.0 + 350.0 * p,  # ramp up boundary penalty
             "or": 8.0 * max(0.0, p - 0.4) ** 2,  # late-phase orient snap
             "dc": 10.0,
         }
@@ -463,12 +473,13 @@ def run_gpu_placement(
         print("\n--- Phase 3: Refinement (frozen theta) ---")
 
     model.Theta.requires_grad_(False)
-    opt2 = torch.optim.AdamW([model.X, model.Y], lr=lr * 0.3)
+    opt2 = torch.optim.AdamW([model.X, model.Y], lr=lr * 0.5)
 
     refine_iters = 400
     for it in range(refine_iters):
         w = {
             "gamma": 1.0,
+            "beta": 5.0,  # maintain hard boundaries during refinement
             "wl": 1.0,
             "ov": 500.0,
             "bd": 500.0,
