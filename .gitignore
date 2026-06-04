@@ -127,3 +127,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Project generated outputs
+placement.png
+tests/*_placed*.kicad_pcb

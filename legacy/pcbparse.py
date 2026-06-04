@@ -11,7 +11,10 @@ class Board(object):
     def __init__(self):
         self.Clear()
         currentdir = os.path.dirname(os.path.realpath(__file__))
-        self.filename_default = os.path.join(currentdir, 'tests', 'leds.kicad_pcb')
+        tests_dir = os.path.join(currentdir, 'tests')
+        if not os.path.exists(tests_dir):
+            tests_dir = os.path.join(os.path.dirname(currentdir), 'tests')
+        self.filename_default = os.path.join(tests_dir, 'leds.kicad_pcb')
         
     def Load(self, filename = None):
         
@@ -29,8 +32,8 @@ class Board(object):
         self.title_block = ''
 
 
-        # self.layers = Layers()
-        # self.layers = ''
+        #self.layers = Layers()
+        #self.layers = ''
         self.setup = ''
         self.property = ''
         self.net = []

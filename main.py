@@ -1,412 +1,716 @@
-import tkinter as tk
-from tkinter.scrolledtext import ScrolledText
-import math
-import time
+"""Force-directed PCB autoplacer.
 
-from pcbparse import Board
+Overdamped descent on per-net springs (applied at pins, so torque rotates parts)
+plus AABB repulsion, with periodic Hungarian-based pin-swap optimization.
+Constraints: per-component allowed_rect or allowed_polygon, plus a discrete
+set of allowed orientations.
+"""
 
-# import cProfile
+from __future__ import annotations
+from dataclasses import dataclass, field
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
-ELECTRON_CONSTANT = 0.002
-SPRING_CONSTANT = 0.0005
-TORQUE_CONSTANT = 2.0
-DAMPING = 0.99
-    
-class Viewport:
-    def __init__(self):
-        self.zoom = 3
-        self.pan = [0,0]
-        self.tk_shapes = []
-        self.tk_nets = []
-        self.tk_lines = []
-        
-        window = tk.Tk()
-        window.winfo_toplevel().title("Force-Directed Autoplacer")
+QUAD = [0.0, np.pi / 2, np.pi, 3 * np.pi / 2]
 
 
-        window.rowconfigure([0, 1], minsize=25, weight=1)
-        window.columnconfigure([0, 1], minsize=25, weight=1)
-        
-        optFrame = tk.Frame(master=window, height=50,relief=tk.RAISED,borderwidth=1)
-        optFrame.grid(row=1, column=0, sticky="nsew", columnspan=2)
-        
-        netFrame = tk.Frame(master=window, width=220,height=600,relief=tk.SUNKEN,borderwidth=1)
-        netFrame.grid(row=0, column=1, sticky="nse")
-        netFrame.rowconfigure([0], minsize=25, weight=1)
-        netFrame.columnconfigure([0, 1], weight=1)
-        netFrame.grid_propagate(0)
-        
-        defaultbg = window.cget('bg')
-        self.netCanvas = ScrolledText(netFrame,width=200,height=600, bg=defaultbg, cursor="arrow")
-        
-        self.netCanvas.grid(row=0, column=1, sticky="nw")
-
-        c = tk.Canvas(window, height=600,width=600, bg="black")
-        
-        c.grid(row=0, column=0, sticky="nsew")
+# ---------- Data ----------
 
 
-        optFrame.rowconfigure([0, 1], minsize=25, weight=1)
+@dataclass
+class Pin:
+    local_pos: np.ndarray
+    net: str
 
-        optFrame.columnconfigure([0, 1, 2, 3, 4, 5], minsize=50, weight=1)
 
-        self.speed = tk.IntVar(value=33)
-        label = tk.Label(text="Speed (FPS)", master=optFrame)
-        label.grid(row=0, column=0, sticky="nsew")
-        entry = tk.Entry(master=optFrame, text=self.speed)
-        entry.grid(row=0, column=1)
-        
-        
-        self.damping = tk.StringVar(value="0.9")
-        label = tk.Label(text="Damping", master=optFrame)
-        label.grid(row=1, column=0, sticky="nsew")
-        entry = tk.Entry(master=optFrame, text=self.damping)
-        entry.grid(row=1, column=1)
-        
-        self.attraction = tk.StringVar(value="0.0005")
-        label = tk.Label(text="Attraction", master=optFrame)
-        label.grid(row=0, column=2, sticky="nsew")
-        entry = tk.Entry(master=optFrame, text=self.attraction)
-        entry.grid(row=0, column=3)
-        
-        self.repulsion = tk.StringVar(value="0.02")
-        label = tk.Label(text="Repulsion", master=optFrame)
-        label.grid(row=1, column=2, sticky="nsew")
-        entry = tk.Entry(master=optFrame, text=self.repulsion)
-        entry.grid(row=1, column=3)
-            
-        button = tk.Button(text="Reset", master=optFrame, command=self.Reset)
-        button.grid(row=1, column=5, sticky="nsew")
-        
-        self.w = window
-        self.c = c
-        
-    def Load(self, nets):
-        #net #, name, count, checked
-        activenets = 0
-        for net in enumerate(nets.netnames):
-            self.tk_nets.append([net,tk.IntVar(value=1)])
-            netlabel = tk.Checkbutton(text=net, master=self.netCanvas, justify=tk.LEFT, variable=self.tk_nets[activenets][1])
-            
-            self.netCanvas.window_create('end', window=netlabel)
-            self.netCanvas.insert('end', '\n')
-            activenets += 1
+@dataclass
+class Component:
+    id: str
+    pos: np.ndarray
+    theta: float = 0.0
+    half_size: np.ndarray = field(default_factory=lambda: np.array([2.5, 2.5]))
+    pins: list = field(default_factory=list)
+    fixed: bool = False
+    allowed_rect: tuple | None = None
+    allowed_polygon: np.ndarray | None = None
+    allowed_orientations: list | None = None
 
-        self.netCanvas['state'] = 'disabled'
-        
-    def Draw(self, footprints, nets, activenets):
-        self.footprints = footprints
-        self.nets = nets
-        z = self.zoom
-        self.c.delete("all")
-        #Footprints
-        for fp in footprints:
-            move = fp.coord_current
-            i = 0
-            while i < len(fp.shapes):
-                poly = []
-                shape = fp.rotate(fp.shapes[i], move[2], [0,0])
-                for pts in shape:
-                    poly.append([(pts[0] + move[0]) * z, (pts[1] + move[1]) * z])
-                if len(poly) > 0:
-                    self.tk_shapes.append(self.c.create_polygon(*poly, fill=fp.shape_fills[i]))
-                i += 1
-            for hole in fp.holes:
-                pts = fp.rotate([[hole[0],hole[1]],[hole[2],hole[3]]], move[2], [0,0])
-                pts = [(pts[0][0] + move[0]) * z, (pts[0][1] + move[1]) * z, (pts[1][0] + move[0]) * z, (pts[1][1] + move[1]) * z]
-                self.c.create_oval(*pts, fill="grey")
-        
-        #Nets
-        for net in activenets:
-            # print(net)
-            for i, conn in enumerate(nets.netnames[net]):
-                for e in range(i):
-                    pos1 = nets.netnames[net][i]
-                    xy1 = footprints[pos1[0]].anchors_rotated[pos1[1]].copy()
-                    xy1[0] += footprints[pos1[0]].coord_current[0]
-                    xy1[1] += footprints[pos1[0]].coord_current[1]
-                    pos2 = nets.netnames[net][e]
-                    xy2 = footprints[pos2[0]].anchors_rotated[pos2[1]].copy()
-                    xy2[0] += footprints[pos2[0]].coord_current[0]
-                    xy2[1] += footprints[pos2[0]].coord_current[1]
-                    self.tk_lines.append(self.c.create_line(xy1[0] * z,xy1[1] * z,xy2[0] * z,xy2[1] * z, fill="white"))
-        
-    def Animate_calc(self):
-        global ELECTRON_CONSTANT
-        global SPRING_CONSTANT
-        global TORQUE_CONSTANT
-        global DAMPING
-        try:
-            DAMPING = float(self.damping.get())
-        except:
-            DAMPING = 1
-        try:
-            ELECTRON_CONSTANT = float(self.repulsion.get())
-        except:
-            ELECTRON_CONSTANT = 0
-        try:
-            SPRING_CONSTANT = float(self.attraction.get())
-        except:
-            SPRING_CONSTANT = 0
-            
-                
-        for fp in self.footprints:
-            fp.Move()
-            # nets.Draw(footprints)
-            
-        activenets = []
-        for net in self.tk_nets:
-            if int(net[1].get()) == 1:
-                activenets.append(net[0][1])
-                
-        nets.Calc(footprints, activenets)
-        
-        self.Draw(self.footprints, self.nets,activenets)
-        
-            
-    def Animate(self):
-        startTime = time.time_ns()
-        # cProfile.runctx('self.Animate_calc()', globals(), locals())
-        self.Animate_calc()
-        try:
-            speed = int(self.speed.get())
-        except:
-            speed = 1
-        if speed == 0:
-            speed = 1
-            
-        endTime = time.time_ns()
-        totalTime = endTime - startTime
-        delayUS = (1000000.0 / speed) - totalTime
-        if delayUS < 10000.0:
-            delayUS = 10000
-        self.w.after(int(delayUS / 1000), self.Animate)
-        
-    def Reset(self):
-        for fp in self.footprints:
-            fp.Reset()
-        
-    def Start(self):
-        self.Animate()
-        self.w.mainloop()
-        
-class Nets:
-    def __init__(self):
-        self.nets = []
-        self.netnames = {}
-    
-    def Load(self, nets):
-        #net format: net number, name, count, checked
-        activenets = 0
-        for i, net in enumerate(nets):
-            if net[2] > 1:
-                self.netnames[nets[i][1]] = []
-    
-    def calc_electron(self, pos1, pos2):
-        # return [0,0]
-        dx = pos2[0] - pos1[0]
-        dy = pos2[1] - pos1[1]
-        distance = math.sqrt(dx ** 2 + dy ** 2)
-        if distance == 0:
-            return [0, 0]
-        force = ELECTRON_CONSTANT # * distance
-        return [force * dx / (distance ** 2), force * dy / (distance ** 2)]
-    
-    def calc_spring(self, pos1, pos2):
-        # return [0,0]
-        dx = pos2[0] - pos1[0]
-        dy = pos2[1] - pos1[1]
-        distance = math.sqrt(dx ** 2 + dy ** 2)
-        if distance == 0:
-            return [0, 0]
-        force = SPRING_CONSTANT # * distance
-        return [force * dx, force * dy]
-    
-    def calc_torque(self, force, xy):
-        # return 0
-        distance = math.sqrt(xy[0] ** 2 + xy[1] ** 2)
-        
-        torque = xy[0]*force[1] - xy[1]*force[0]
-        return torque * TORQUE_CONSTANT
-    
-    def Calc(self, footprints, activenets):
-        for i1, fp1 in enumerate(footprints):
-            for i2, fp2 in enumerate(footprints):
-                if i1 != i2:
-                    if footprints[i1].locked == False:
-                        force = self.calc_electron(fp1.coord_current, fp2.coord_current) 
-                        footprints[i1].momentum[0] -= force[0]
-                        footprints[i1].momentum[1] -= force[1]
-                    
-        for net in activenets:
-            for i, conn in enumerate(self.netnames[net]):
-                for e, conn in enumerate(self.netnames[net]):
-                    if i != e:
-                        pos1 = self.netnames[net][i]
-                        pos2 = self.netnames[net][e]
-                        if pos1[0] != pos2[0]:
-                            if footprints[pos1[0]].locked == False:
 
-                                xy1 = [sum(x) for x in zip(footprints[pos1[0]].anchors_rotated[pos1[1]], footprints[pos1[0]].coord_current)]
-                                xy2 = [sum(x) for x in zip(footprints[pos2[0]].anchors_rotated[pos2[1]], footprints[pos2[0]].coord_current)]
-                                
-                                force = self.calc_spring(xy1, xy2)
-                                torque = self.calc_torque(force, footprints[pos1[0]].anchors_rotated[pos1[1]])
-                                footprints[pos1[0]].momentum[0] += force[0]
-                                footprints[pos1[0]].momentum[1] += force[1]
-                                footprints[pos1[0]].momentum[2] += torque
-                        
-        for i, fp in enumerate(footprints): 
-            footprints[i].momentum[0] *= DAMPING
-            footprints[i].momentum[1] *= DAMPING
-            footprints[i].momentum[2] *= DAMPING
-            
-    def Associate(self, footprints):
-        for i_f, fp in enumerate(footprints):
-            for i_p, pad in enumerate(fp.nets):
-                if len(pad) > 1:
-                    if pad[1] in self.netnames:
-                        self.netnames[pad[1]].append([i_f, i_p])
-        
-class Footprint:
-    def __init__(self, mod = False):
-        self.coord_initial = [0,0,0]
-        self.coord_current = [0,0,0]
-        self.shapes_initial = []
-        self.shapes = []
-        self.shape_fills = []
-        self.holes = []
-        self.holes_initial = []
-        self.anchors_initial = []
-        self.anchors = []
-        self.anchors_rotated = []
-        self.nets = []
-        self.force = 1
-        self.momentum = [0,0,0]
-        self.locked = False
-        
-        if mod != False:
-            self.Load(mod)
-        
-    def Load(self, mod):
-        self.locked = mod.locked
-        self.coord_initial = mod.at
-        if len(self.coord_initial) == 2:
-            self.coord_initial.append(0)
-        
-        self.coord_current = self.coord_initial.copy()
-        #courtyard
-        points = {}
-        polypoints = []
-        for line in mod.fp_line:
-            if line.layer == 'F.CrtYd':
-                if len(polypoints) == 0:
-                    polypoints.append(line.start)
-                    
-                #Conversion of mixed up start/end points to a polygon, by way of dictionary entries
-                key = "{},{}".format(line.start[0],line.start[1])
-                if key in points.keys():
-                    key = "{},{}".format(line.end[0],line.end[1])
-                    if key in points.keys():
-                        temp = points[key]
-                        points[key] = line.start
-                        key = "{},{}".format(temp[0],temp[1])
-                        points[key] = line.end
-                    else:
-                        line.end = line.start
-                points[key] = line.end
-            
-        for i in range(len(points)):
-            key = "{},{}".format(polypoints[i][0],polypoints[i][1])
-            polypoints.append(points[key])
-            
-        # polypoints = self.rotate(polypoints, self.coord_current[2], [0,0])
-        self.shapes_initial.append(polypoints)
-        self.shapes.append(polypoints)
-        self.shape_fills.append('red')
-        
-        #pads
-        for pad in mod.pad:
-            if pad.attribute == "smd":
-                polypoints = []
-                
-                # pad.at = self.rotate([pad.at], self.coord_current[2], [0,0])[0]
-                polypoints.append([(pad.at[0] - (pad.size[0] / 2.0)), (pad.at[1] - (pad.size[1] / 2.0))])
-                polypoints.append([(pad.at[0] + (pad.size[0] / 2.0)), (pad.at[1] - (pad.size[1] / 2.0))])
-                polypoints.append([(pad.at[0] + (pad.size[0] / 2.0)), (pad.at[1] + (pad.size[1] / 2.0))])
-                polypoints.append([(pad.at[0] - (pad.size[0] / 2.0)), (pad.at[1] + (pad.size[1] / 2.0))])
-                # polypoints = self.rotate(polypoints, self.coord_current[2], [0,0])
-                self.shapes.append(polypoints)
-                self.shapes_initial.append(polypoints)
-                self.shape_fills.append('grey')
+@dataclass
+class SwapGroup:
+    component_id: str
+    pin_indices: list
+
+
+# ---------- Geometry ----------
+
+
+def rot(theta):
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]])
+
+
+def pin_world(comp, pin):
+    return comp.pos + rot(comp.theta) @ pin.local_pos
+
+
+def hs_rot(c):
+    """Half-size after a 90-deg rotation snap; axes swap on odd quadrants."""
+    return c.half_size[::-1] if round(c.theta / (np.pi / 2)) % 2 else c.half_size
+
+
+def point_in_polygon(p, poly):
+    inside, n, j = False, len(poly), len(poly) - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > p[1]) != (yj > p[1])) and (
+            p[0] < (xj - xi) * (p[1] - yi) / (yj - yi + 1e-12) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def closest_on_polygon(p, poly):
+    best, best_d = poly[0], np.inf
+    for i in range(len(poly)):
+        a, b = poly[i], poly[(i + 1) % len(poly)]
+        ab = b - a
+        t = max(0.0, min(1.0, float((p - a) @ ab) / (float(ab @ ab) + 1e-12)))
+        q = a + t * ab
+        d = float((p - q) @ (p - q))
+        if d < best_d:
+            best_d, best = d, q
+    return best
+
+
+# ---------- Forces ----------
+
+
+def attractive(components, nets):
+    F_lin = {cid: np.zeros(2) for cid in components}
+    F_tor = {cid: 0.0 for cid in components}
+    for members in nets.values():
+        if len(members) < 2:
+            continue
+        positions = [
+            pin_world(components[cid], components[cid].pins[pi]) for cid, pi in members
+        ]
+        center = np.mean(positions, axis=0)
+        for (cid, _), pos in zip(members, positions):
+            f = center - pos
+            F_lin[cid] += f
+            r = pos - components[cid].pos
+            F_tor[cid] += r[0] * f[1] - r[1] * f[0]
+    return F_lin, F_tor
+
+
+def repulsive(components, k=30.0, slop=0.4):
+    F = {cid: np.zeros(2) for cid in components}
+    ids = list(components.keys())
+    for i in range(len(ids)):
+        a = components[ids[i]]
+        ah = hs_rot(a)
+        for j in range(i + 1, len(ids)):
+            b = components[ids[j]]
+            bh = hs_rot(b)
+            dx, dy = b.pos[0] - a.pos[0], b.pos[1] - a.pos[1]
+            ox = ah[0] + bh[0] + slop - abs(dx)
+            oy = ah[1] + bh[1] + slop - abs(dy)
+            if ox <= 0 or oy <= 0:
+                continue
+            if ox < oy:
+                push = np.array([np.sign(dx or 1) * ox * k, 0.0])
             else:
-                at = [(pad.at[0] - (pad.size[0] / 2.0)), (pad.at[1] - (pad.size[1] / 2.0))]
-                at.append((pad.at[0] + (pad.size[0] / 2.0)))
-                at.append((pad.at[1] + (pad.size[1] / 2.0)))
-                self.holes.append(at)
-                self.holes_initial.append(at)
-            self.nets.append(pad.net)
-            self.anchors.append([pad.at[0], pad.at[1]])
-            self.anchors_initial.append([pad.at[0], pad.at[1]])
-            
-        self.anchors_rotated = self.rotate(self.anchors, self.coord_current[2], [0,0])
-            
-        
-    def rotate(self, points, angle, center):
-        angle = math.radians(angle)
-        cos_val = math.cos(angle)
-        sin_val = math.sin(angle)
-        cx, cy = center
-        new_points = []
-        for x_old, y_old in points:
-            x_old -= cx
-            y_old -= cy
-            x_new = x_old * cos_val - y_old * sin_val
-            y_new = x_old * sin_val + y_old * cos_val
-            new_points.append([x_new + cx, y_new + cy])
-        return new_points
-        
-    def Move(self, move = False):
-        if move is False:
-            move = self.momentum
-        # new_shapes = []
-        # for shape in self.shapes:
-            # pts = self.rotate(shape, move[2], [0,0]) # self.coord_current[0:2])
-            # new_shapes.append(pts)
-        # self.shapes = new_shapes
-        self.coord_current[0] += move[0]
-        self.coord_current[1] += move[1]
-        self.coord_current[2] += move[2]
-        self.anchors_rotated = self.rotate(self.anchors, self.coord_current[2], [0,0])
-            
-    def Reset(self):
-        self.anchors = self.anchors_initial.copy()
-        self.coord_current = self.coord_initial.copy()
-        self.shapes = self.shapes_initial.copy()
-        self.holes = self.holes_initial.copy()
-        self.momentum = [0,0,0]
+                push = np.array([0.0, np.sign(dy or 1) * oy * k])
+            F[ids[i]] -= push
+            F[ids[j]] += push
+    return F
 
 
-if __name__ == '__main__':
-
-    vp = Viewport()
-
-    pcb = Board()
-    pcb.Load()
-
-    nets = Nets()
-    nets.Load(pcb.net)
-    
-    footprints = []
-    
-    for i, mod in enumerate(pcb.module):
-        fp = Footprint(mod)
-        footprints.append(fp)
-    
-    nets.Associate(footprints)
-    
-    vp.Load(nets)
-    vp.Draw(footprints, nets, [])
+# ---------- Constraints ----------
 
 
-    vp.Start()
+def project_position(comp):
+    if comp.allowed_rect is not None:
+        x0, y0, x1, y1 = comp.allowed_rect
+        comp.pos[0] = np.clip(comp.pos[0], x0, x1)
+        comp.pos[1] = np.clip(comp.pos[1], y0, y1)
+        return
+    poly = comp.allowed_polygon
+    if poly is None:
+        return
+    if not point_in_polygon(comp.pos, poly):
+        comp.pos = closest_on_polygon(comp.pos, poly)
+    # Push body inside: any of the 4 AABB corners outside the polygon
+    # gets projected back; max-magnitude per-axis push is applied to the center.
+    for _ in range(6):
+        hs = hs_rot(comp)
+        corners = comp.pos + np.array(
+            [[-hs[0], -hs[1]], [hs[0], -hs[1]], [hs[0], hs[1]], [-hs[0], hs[1]]]
+        )
+        push = np.zeros(2)
+        moved = False
+        for corner in corners:
+            if point_in_polygon(corner, poly):
+                continue
+            d = closest_on_polygon(corner, poly) - corner
+            if abs(d[0]) > abs(push[0]):
+                push[0] = d[0]
+            if abs(d[1]) > abs(push[1]):
+                push[1] = d[1]
+            moved = True
+        if not moved:
+            return
+        comp.pos = comp.pos + push
+
+
+def snap_orientation(comp, strength):
+    """strength in [0, 1]; 1.0 is a hard snap."""
+    if comp.allowed_orientations is None or strength <= 0:
+        return
+    deltas = [
+        (a - comp.theta + np.pi) % (2 * np.pi) - np.pi
+        for a in comp.allowed_orientations
+    ]
+    comp.theta += strength * min(deltas, key=abs)
+
+
+# ---------- Pin swap (Hungarian) ----------
+
+
+def rebuild_nets(components):
+    nets = {}
+    for cid, comp in components.items():
+        for pi, pin in enumerate(comp.pins):
+            nets.setdefault(pin.net, []).append((cid, pi))
+    return nets
+
+
+def optimize_swap_group(components, nets, group):
+    comp = components[group.component_id]
+    pins = [comp.pins[i] for i in group.pin_indices]
+    nets_g = [p.net for p in pins]
+    pos_g = [pin_world(comp, p) for p in pins]
+
+    # Net centroid excluding the pins in this swap group (so it doesn't pull itself)
+    centroids = []
+    for net in nets_g:
+        others = [
+            pin_world(components[cid], components[cid].pins[pi])
+            for cid, pi in nets[net]
+            if not (cid == comp.id and pi in group.pin_indices)
+        ]
+        centroids.append(np.mean(others, axis=0) if others else comp.pos)
+
+    n = len(pins)
+    cost = np.array(
+        [
+            [float(np.sum((pos_g[i] - centroids[j]) ** 2)) for j in range(n)]
+            for i in range(n)
+        ]
+    )
+    _, col = linear_sum_assignment(cost)
+    for i, j in enumerate(col):
+        comp.pins[group.pin_indices[i]].net = nets_g[j]
+
+
+# ---------- Main loop ----------
+
+
+def run(components, swap_groups, n_iters=800, dt0=0.05, swap_every=25, snap_phase=0.4):
+    dt = dt0
+    for it in range(n_iters):
+        nets = rebuild_nets(components)
+        Fa, Tor = attractive(components, nets)
+        Fr = repulsive(components)
+        snap_str = max(0.0, (it / n_iters - snap_phase) / (1 - snap_phase)) ** 2
+
+        for cid, comp in components.items():
+            if comp.fixed:
+                continue
+            comp.pos = comp.pos + dt * (Fa[cid] + Fr[cid])
+            # Single allowed orientation -> freeze rotation
+            if (
+                comp.allowed_orientations is not None
+                and len(comp.allowed_orientations) == 1
+            ):
+                comp.theta = comp.allowed_orientations[0]
+            else:
+                comp.theta += dt * 0.15 * Tor[cid]
+                snap_orientation(comp, snap_str * 0.5)
+            project_position(comp)
+
+        if it > 0 and it % swap_every == 0:
+            for g in swap_groups:
+                optimize_swap_group(components, nets, g)
+        dt *= 0.996
+
+    # Final hard snap + one more swap pass
+    for comp in components.values():
+        if not comp.fixed:
+            snap_orientation(comp, 1.0)
+            project_position(comp)
+    nets = rebuild_nets(components)
+    for g in swap_groups:
+        optimize_swap_group(components, nets, g)
+
+
+# ---------- Viz ----------
+
+
+def draw(components, board, ax, title):
+    ax.set_aspect("equal")
+    ax.set_title(title)
+    ax.add_patch(
+        patches.Polygon(
+            board, facecolor="#f6f6e8", edgecolor="#444", linewidth=1.6, zorder=0
+        )
+    )
+    for members in rebuild_nets(components).values():
+        if len(members) < 2:
+            continue
+        pts = [
+            pin_world(components[cid], components[cid].pins[pi]) for cid, pi in members
+        ]
+        # Skip dense power nets for visual clarity
+        net = components[members[0][0]].pins[members[0][1]].net
+        if net in ("GND", "VCC"):
+            continue
+        ctr = np.mean(pts, axis=0)
+        for p in pts:
+            ax.plot(
+                [p[0], ctr[0]],
+                [p[1], ctr[1]],
+                "-",
+                color="#6b6",
+                alpha=0.5,
+                linewidth=0.8,
+            )
+    for cid, c in components.items():
+        box = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]]) * c.half_size
+        corners = (rot(c.theta) @ box.T).T + c.pos
+        color = "#fcc" if cid.startswith("J_") else "#cce"
+        ax.add_patch(
+            patches.Polygon(
+                corners, facecolor=color, edgecolor="#225", linewidth=1.0, zorder=2
+            )
+        )
+        ax.text(
+            c.pos[0], c.pos[1], cid, ha="center", va="center", fontsize=6.5, zorder=3
+        )
+        for p in c.pins:
+            wp = pin_world(c, p)
+            ax.plot(wp[0], wp[1], "o", color="#225", markersize=1.8, zorder=3)
+
+
+# ---------- KiCad PCB import ----------
+#
+# KiCad uses S-expressions and a Y-down coordinate frame. We negate Y on read
+# so the internal frame is Y-up (matches matplotlib and the rest of the code).
+# Footprint bbox is estimated from pad extents + a small margin -- not perfect
+# (real bbox is in the F.CrtYd courtyard layer) but adequate for placement.
+# Edge.Cuts arcs are not handled; gr_line and gr_rect only.
+
+
+def parse_sexp(text):
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c in "()":
+            tokens.append(c)
+            i += 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            tokens.append(text[i : j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in "()":
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    p = [0]
+
+    def parse():
+        if tokens[p[0]] != "(":
+            t = tokens[p[0]]
+            p[0] += 1
+            return t
+        p[0] += 1
+        out = []
+        while tokens[p[0]] != ")":
+            out.append(parse())
+        p[0] += 1
+        return out
+
+    return parse()
+
+
+def _find(node, tag):
+    return [c for c in node if isinstance(c, list) and c and c[0] == tag]
+
+
+def _first(node, tag):
+    for c in node:
+        if isinstance(c, list) and c and c[0] == tag:
+            return c
+    return None
+
+
+def _unq(s):
+    return s[1:-1] if isinstance(s, str) and len(s) >= 2 and s[0] == '"' == s[-1] else s
+
+
+def _chain_segments(segs, tol=0.01):
+    """Walk a soup of (start, end) segments into a single polygon."""
+    if not segs:
+        return None
+    k = lambda p: (round(p[0] / tol) * tol, round(p[1] / tol) * tol)
+    rem = list(segs)
+    poly = [rem[0][0], rem[0][1]]
+    rem.pop(0)
+    while rem:
+        last = k(poly[-1])
+        for i, (a, b) in enumerate(rem):
+            if k(a) == last:
+                poly.append(b)
+                rem.pop(i)
+                break
+            if k(b) == last:
+                poly.append(a)
+                rem.pop(i)
+                break
+        else:
+            break
+    if len(poly) > 1 and k(poly[0]) == k(poly[-1]):
+        poly.pop()
+    return np.array(poly)
+
+
+def import_kicad_pcb(path):
+    root = parse_sexp(open(path).read())
+    comps = {}
+
+    for fp in _find(root, "footprint"):
+        ref = next(
+            (_unq(t[2]) for t in _find(fp, "fp_text") if len(t) > 2 and t[1] == "reference"),
+            None,
+        )
+        if not ref:
+            ref = next(
+                (_unq(p[2]) for p in _find(fp, "property") if len(p) > 2 and _unq(p[1]) == "Reference"),
+                None,
+            )
+        if not ref:
+            continue
+        at = _first(fp, "at")
+        fx, fy = float(at[1]), -float(at[2])
+        ftheta = np.radians(float(at[3])) if len(at) > 3 else 0.0
+
+        pins, xs, ys = [], [], []
+        for pad in _find(fp, "pad"):
+            pa = _first(pad, "at")
+            px, py = float(pa[1]), -float(pa[2])
+            nn = _first(pad, "net")
+            net = _unq(nn[2] if len(nn) > 2 else nn[1]) if nn else f"NC_{ref}_{_unq(pad[1])}"
+            pins.append(Pin(np.array([px, py]), net))
+            sz = _first(pad, "size")
+            sw, sh = float(sz[1]), float(sz[2])
+            xs.extend([px - sw / 2, px + sw / 2])
+            ys.extend([py - sh / 2, py + sh / 2])
+
+        hw = max(abs(min(xs)), abs(max(xs))) + 0.3 if xs else 1.5
+        hh = max(abs(min(ys)), abs(max(ys))) + 0.3 if ys else 1.5
+        comps[ref] = Component(
+            id=ref,
+            pos=np.array([fx, fy]),
+            theta=ftheta,
+            half_size=np.array([hw, hh]),
+            pins=pins,
+            allowed_orientations=QUAD,
+        )
+
+    segs = []
+    for gl in _find(root, "gr_line"):
+        ly = _first(gl, "layer")
+        if ly and _unq(ly[1]) == "Edge.Cuts":
+            s, e = _first(gl, "start"), _first(gl, "end")
+            segs.append(((float(s[1]), -float(s[2])), (float(e[1]), -float(e[2]))))
+    for ga in _find(root, "gr_arc"):
+        ly = _first(ga, "layer")
+        if ly and _unq(ly[1]) == "Edge.Cuts":
+            s, e = _first(ga, "start"), _first(ga, "end")
+            if s and e:
+                segs.append(((float(s[1]), -float(s[2])), (float(e[1]), -float(e[2]))))
+    for gr in _find(root, "gr_rect"):
+        ly = _first(gr, "layer")
+        if ly and _unq(ly[1]) == "Edge.Cuts":
+            s, e = _first(gr, "start"), _first(gr, "end")
+            x1, y1 = float(s[1]), -float(s[2])
+            x2, y2 = float(e[1]), -float(e[2])
+            segs.extend(
+                [
+                    ((x1, y1), (x2, y1)),
+                    ((x2, y1), (x2, y2)),
+                    ((x2, y2), (x1, y2)),
+                    ((x1, y2), (x1, y1)),
+                ]
+            )
+
+    board = _chain_segments(segs)
+    for c in comps.values():
+        c.allowed_polygon = board
+    return comps, board
+
+
+# ---------- Example ----------
+
+
+def build_example():
+    rng = np.random.default_rng(11)
+    board = np.array([[0, 0], [30, 0], [30, 20], [15, 20], [15, 10], [0, 10]], float)
+    comps = {}
+
+    def add(cid, hs, pin_specs, pos=None, rect=None, theta=0.0, orient=None):
+        comps[cid] = Component(
+            id=cid,
+            pos=np.array(
+                pos if pos is not None else rng.uniform([3, 3], [27, 17]), float
+            ),
+            theta=theta,
+            half_size=np.array(hs, float),
+            pins=[Pin(np.array(lp, float), net) for lp, net in pin_specs],
+            allowed_rect=rect,
+            allowed_polygon=board if rect is None else None,
+            allowed_orientations=orient if orient is not None else QUAD,
+        )
+
+    add(
+        "U1",
+        (3.0, 3.0),
+        [
+            ((-2.5, 2.5), "VCC"),
+            ((-2.5, -2.5), "GND"),
+            ((2.5, 2.5), "USB_DP"),
+            ((2.5, 1.5), "USB_DM"),
+            ((2.5, 0.5), "SWDIO"),
+            ((2.5, -0.5), "SWCLK"),
+            ((2.5, -1.5), "LED1_CTRL"),
+            ((2.5, -2.5), "LED2_CTRL"),
+            ((-2.5, 0.5), "GPIO1"),
+            ((-2.5, -0.5), "GPIO2"),
+            ((0.5, -2.5), "XTAL1"),
+            ((1.5, -2.5), "XTAL2"),
+        ],
+    )
+    add("C1", (0.7, 0.4), [((-0.7, 0), "VCC"), ((0.7, 0), "GND")])
+    add("C2", (0.7, 0.4), [((-0.7, 0), "VCC"), ((0.7, 0), "GND")])
+    add("R1", (1.0, 0.4), [((-1, 0), "LED1_CTRL"), ((1, 0), "LED1_A")])
+    add("D1", (0.8, 0.4), [((-0.8, 0), "LED1_A"), ((0.8, 0), "GND")])
+    add("R2", (1.0, 0.4), [((-1, 0), "LED2_CTRL"), ((1, 0), "LED2_A")])
+    add("D2", (0.8, 0.4), [((-0.8, 0), "LED2_A"), ((0.8, 0), "GND")])
+    add("Y1", (1.4, 0.6), [((-1.4, 0), "XTAL1"), ((1.4, 0), "XTAL2")])
+
+    # Connectors: thin edge strip + single orientation
+    add(
+        "J_USB",
+        (2.5, 1.2),
+        [
+            ((-1.8, -0.9), "VCC"),
+            ((-1.8, -0.3), "USB_DP"),
+            ((-1.8, 0.3), "USB_DM"),
+            ((-1.8, 0.9), "GND"),
+        ],
+        pos=(22, 18.5),
+        rect=(17.5, 18.5, 28.0, 18.5),
+        theta=np.pi / 2,
+        orient=[np.pi / 2],
+    )
+    add(
+        "J_DEBUG",
+        (2.5, 1.5),
+        [
+            ((-1.8, -0.9), "SWDIO"),
+            ((-1.8, -0.3), "SWCLK"),
+            ((-1.8, 0.3), "GND"),
+            ((-1.8, 0.9), "VCC"),
+        ],
+        pos=(28.5, 10),
+        rect=(28.5, 3.0, 28.5, 17.0),
+        theta=0.0,
+        orient=[0.0],
+    )
+    add(
+        "J_GPIO",
+        (2.5, 1.2),
+        [((-1.8, -0.6), "GPIO1"), ((-1.8, 0.0), "GPIO2"), ((-1.8, 0.6), "GND")],
+        pos=(1.5, 5),
+        rect=(1.5, 3.0, 1.5, 7.0),
+        theta=np.pi,
+        orient=[np.pi],
+    )
+    add(
+        "J_PWR",
+        (2.0, 1.2),
+        [((-1.5, -0.5), "VCC"), ((-1.5, 0.5), "GND")],
+        pos=(10, 1.5),
+        rect=(4.0, 1.5, 26.0, 1.5),
+        theta=3 * np.pi / 2,
+        orient=[3 * np.pi / 2],
+    )
+
+    return comps, [SwapGroup("R1", [0, 1]), SwapGroup("R2", [0, 1])], board
+
+
+if __name__ == "__main__":
+    import sys
+    import os
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Force-Directed PCB Autoplacer (with optional GPU acceleration)"
+    )
+    ap.add_argument(
+        "pcb",
+        nargs="?",
+        default=os.path.join("tests", "simple.kicad_pcb"),
+        help="Path to .kicad_pcb file (default: tests/simple.kicad_pcb)",
+    )
+    ap.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Use legacy force-directed solver instead of GPU optimizer",
+    )
+    ap.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU even when CUDA is available",
+    )
+    ap.add_argument(
+        "--iters",
+        type=int,
+        default=1500,
+        help="Number of global-placement iterations (default: 1500)",
+    )
+    ap.add_argument(
+        "--lr",
+        type=float,
+        default=0.05,
+        help="Learning rate for AdamW optimizer (default: 0.05)",
+    )
+    ap.add_argument(
+        "--export",
+        type=str,
+        default=None,
+        help="Export placed PCB to this file path (e.g. output_placed.kicad_pcb)",
+    )
+    ap.add_argument(
+        "--no-scramble",
+        action="store_true",
+        help="Keep original component positions (don't randomize before placing)",
+    )
+    args = ap.parse_args()
+
+    pcb = args.pcb
+    use_example = False
+
+    if not os.path.exists(pcb):
+        print(f"PCB file not found: {pcb}. Running dummy example instead.")
+        components, swap_groups, board = build_example()
+        use_example = True
+    else:
+        components, board = import_kicad_pcb(pcb)
+        if board is None:
+            all_pts = [c.pos for c in components.values()]
+            if all_pts:
+                all_pts = np.array(all_pts)
+                min_p = all_pts.min(axis=0) - 20
+                max_p = all_pts.max(axis=0) + 20
+                board = np.array(
+                    [
+                        [min_p[0], min_p[1]],
+                        [max_p[0], min_p[1]],
+                        [max_p[0], max_p[1]],
+                        [min_p[0], max_p[1]],
+                    ]
+                )
+            else:
+                board = np.array([[0, 0], [100, 0], [100, 100], [0, 100]])
+            for c in components.values():
+                c.allowed_polygon = board
+        swap_groups = [
+            SwapGroup(cid, [0, 1])
+            for cid in ("R1", "R2")
+            if cid in components
+        ]
+
+    # Scramble initial positions so the "before" plot shows the placer at work.
+    xs, ys = board[:, 0], board[:, 1]
+    if not args.no_scramble:
+        rng = np.random.default_rng(0)
+        for c in components.values():
+            if c.id.startswith("J"):
+                c.fixed = True
+                continue
+            c.pos = rng.uniform(
+                [xs.min() + 2, ys.min() + 2], [xs.max() - 2, ys.max() - 2]
+            )
+            project_position(c)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    draw(components, board, axes[0], "Initial (Scrambled)")
+
+    # ── Optimize ──────────────────────────────────────────────────
+    if args.legacy or use_example:
+        print("Running legacy force-directed solver…")
+        run(components, swap_groups, n_iters=800)
+        title = "Converged (Legacy FD)"
+    else:
+        from optim_engine import run_gpu_placement
+
+        device = "cpu" if args.cpu else "cuda"
+        run_gpu_placement(
+            components,
+            board,
+            n_iters=args.iters,
+            lr=args.lr,
+            device=device,
+        )
+        # Post-GPU: project to actual polygon boundary (GPU only used bbox)
+        for comp in components.values():
+            if not comp.fixed:
+                project_position(comp)
+        # Run pin-swap optimization (discrete, not handled by GPU)
+        nets = rebuild_nets(components)
+        for g in swap_groups:
+            optimize_swap_group(components, nets, g)
+        title = "Converged (GPU Optimized)"
+
+    draw(components, board, axes[1], title)
+
+    m = 3
+    for ax in axes:
+        ax.set_xlim(xs.min() - m, xs.max() + m)
+        ax.set_ylim(ys.min() - m, ys.max() + m)
+        ax.grid(alpha=0.2)
+    plt.tight_layout()
+
+    out_img = "placement.png"
+    plt.savefig(out_img, dpi=110)
+    print(f"Saved layout visualization to {out_img}")
+
+    # ── Export placed PCB ─────────────────────────────────────────
+    if args.export and not use_example:
+        from kicad_exporter import export_kicad_pcb
+
+        export_kicad_pcb(pcb, args.export, components)
+
+    print("Placement optimization done.")
