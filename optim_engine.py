@@ -564,4 +564,9 @@ def run_gpu_placement(
         )
         print(f"  Layer assignment: {n_top} Top (F.Cu), {n_bot} Bottom (B.Cu)")
 
+    m["time"] = dt
+    m["n_top"] = n_top
+    m["n_bot"] = n_bot
+    m["n_total"] = prob.n
+
     return m

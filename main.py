@@ -36,7 +36,7 @@ POWER_NETS = {"GND", "VCC", "+3.3V", "+5V", "VBUS"}
 # ── Visualization ─────────────────────────────────────────────────────
 
 
-def draw(components: dict, board: np.ndarray, ax, title: str) -> None:
+def draw(components: dict, board: np.ndarray, ax, title: str, metrics: dict = None) -> None:
     """Draw the board outline, ratsnest lines, and component boxes."""
     ax.set_aspect("equal")
     ax.set_title(title)
@@ -68,14 +68,40 @@ def draw(components: dict, board: np.ndarray, ax, title: str) -> None:
         else:
             face, edge, ls = "#cce", "#225", "-"    # regular: blue
 
+        hatch = "////" if c.fixed else None
+
         ax.add_patch(patches.Polygon(corners, facecolor=face, edgecolor=edge,
-                                     linewidth=1.0, linestyle=ls, zorder=2))
+                                     linewidth=1.0, linestyle=ls, hatch=hatch, zorder=2))
         ax.text(c.pos[0], c.pos[1], cid, ha="center", va="center",
                 fontsize=6.5, color="#822" if is_bottom else "#000", zorder=3)
         for p in c.pins:
             wp = pin_world(c, p)
             ax.plot(wp[0], wp[1], "o", color="#822" if is_bottom else "#225",
                     markersize=1.8, zorder=3)
+
+    # Legend
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="#cce", edgecolor="#225", linestyle="-", label="Top Layer (F.Cu)"),
+        Patch(facecolor="#fdd", edgecolor="#822", linestyle="--", label="Bottom Layer (B.Cu)"),
+        Patch(facecolor="#fcc", edgecolor="#225", linestyle="-", label="Connector"),
+        Patch(facecolor="white", edgecolor="#444", hatch="////", label="Locked/Fixed")
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=8)
+
+    # Metrics overlay
+    if metrics is not None:
+        textstr = "\\n".join((
+            f"Components: {metrics.get('n_total', 0)} ({metrics.get('n_top', 0)} Top, {metrics.get('n_bot', 0)} Bot)",
+            f"Time: {metrics.get('time', 0.0):.2f}s",
+            f"Wirelength Loss: {metrics.get('wire', 0.0):.1f}",
+            f"Overlap Loss: {metrics.get('overlap', 0.0):.1f}",
+            f"Boundary Loss: {metrics.get('boundary', 0.0):.1f}"
+        ))
+        props = dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="#ccc")
+        ax.text(0.02, 0.02, textstr, transform=ax.transAxes, fontsize=8,
+                verticalalignment="bottom", bbox=props)
 
 
 # ── Boundary projection (used after GPU placement) ────────────────────
@@ -212,7 +238,7 @@ if __name__ == "__main__":
     # ── Run optimizer ──
     from optim_engine import run_gpu_placement
     device = "cpu" if args.cpu else "cuda"
-    run_gpu_placement(components, board, n_iters=args.iters, lr=args.lr, device=device)
+    metrics = run_gpu_placement(components, board, n_iters=args.iters, lr=args.lr, device=device)
     # Hard-project any components that drifted just outside the polygon
     for comp in components.values():
         if not comp.fixed:
@@ -224,7 +250,7 @@ if __name__ == "__main__":
     title = "Converged (GPU Optimized)"
 
     # ── After snapshot + save ──
-    draw(components, board, axes[1], title)
+    draw(components, board, axes[1], title, metrics=metrics)
     for ax in axes:
         ax.set_xlim(xs.min() - 3, xs.max() + 3)
         ax.set_ylim(ys.min() - 3, ys.max() + 3)
