@@ -230,16 +230,35 @@ class PlacerModel(nn.Module):
                 device=prob.device,
             )
         )
+        # Layer logits: sigmoid(Z) -> probability of being on Top (F.Cu)
+        # Initialize to +6.0 (Top) or -6.0 (Bottom) based on parsed layer
+        self.Z_logits = nn.Parameter(
+            torch.tensor(
+                [6.0 if getattr(components[c], "layer", "F.Cu") != "B.Cu" else -6.0
+                 for c in prob.all_ids],
+                dtype=torch.float32,
+                device=prob.device,
+            )
+        )
 
     # ── helpers ──
 
     def _pin_world(self, net: dict):
-        """Compute world-space pin positions for a given net."""
+        """Compute world-space pin positions for a given net.
+
+        When a component is on the bottom layer (Z → 0), its local pin X
+        coordinates are mirrored (multiplied by −1) to model physical
+        footprint flipping.
+        """
         i = net["idx"]
         ct = torch.cos(self.Theta[i])
         st = torch.sin(self.Theta[i])
-        wx = self.X[i] + ct * net["lx"] - st * net["ly"]
-        wy = self.Y[i] + st * net["lx"] + ct * net["ly"]
+        # Differentiable layer scale: +1 (Top) or -1 (Bottom)
+        z = torch.sigmoid(self.Z_logits[i])
+        layer_scale = 2.0 * z - 1.0  # maps [0, 1] -> [-1, +1]
+        lx = net["lx"] * layer_scale
+        wx = self.X[i] + ct * lx - st * net["ly"]
+        wy = self.Y[i] + st * lx + ct * net["ly"]
         return wx, wy
 
     # ── loss terms ──
@@ -294,7 +313,12 @@ class PlacerModel(nn.Module):
         # Use softplus instead of relu for smooth gradients
         ox = F.softplus(beta * (sx - dx)) / beta
         oy = F.softplus(beta * (sy - dy)) / beta
-        area = ox * oy
+        area_2d = ox * oy
+
+        # Same-layer probability mask: only penalize overlaps on same layer
+        z = torch.sigmoid(self.Z_logits)
+        same_layer = z.unsqueeze(1) * z.unsqueeze(0) + (1 - z.unsqueeze(1)) * (1 - z.unsqueeze(0))
+        area = same_layer * area_2d
         return area[self.p._triu].sum()
 
     def boundary(self) -> torch.Tensor:
@@ -338,6 +362,15 @@ class PlacerModel(nn.Module):
         ) * 0.7
         return torch.relu(dist - target).pow(2).sum()
 
+    def binarize(self) -> torch.Tensor:
+        """Penalty driving layer probabilities toward 0 or 1.
+
+        z(1−z) = 0 when z ∈ {0, 1}, max at z = 0.5.
+        Only applied to free components.
+        """
+        z = torch.sigmoid(self.Z_logits[self.p.is_free])
+        return (z * (1 - z)).sum()
+
     # ── combined loss ──
 
     def forward(self, w: dict) -> tuple[torch.Tensor, dict]:
@@ -346,6 +379,7 @@ class PlacerModel(nn.Module):
         L_b = self.boundary()
         L_r = self.orient()
         L_d = self.decoup_loss()
+        L_bin = self.binarize()
 
         total = (
             w["wl"] * L_w
@@ -353,6 +387,7 @@ class PlacerModel(nn.Module):
             + w["bd"] * L_b
             + w["or"] * L_r
             + w["dc"] * L_d
+            + w.get("bin", 0.0) * L_bin
         )
         return total, {
             "total": total.item(),
@@ -361,6 +396,7 @@ class PlacerModel(nn.Module):
             "boundary": L_b.item(),
             "orient": L_r.item(),
             "decoup": L_d.item(),
+            "binarize": L_bin.item(),
         }
 
 
@@ -371,7 +407,7 @@ class PlacerModel(nn.Module):
 
 def _zero_fixed(model: PlacerModel) -> None:
     """Zero out gradients for fixed (non-movable) components."""
-    for attr in ("X", "Y", "Theta"):
+    for attr in ("X", "Y", "Theta", "Z_logits"):
         g = getattr(model, attr).grad
         if g is not None:
             g[~model.p.is_free] = 0.0
@@ -436,6 +472,7 @@ def run_gpu_placement(
             "bd": 50.0 + 350.0 * p,  # ramp up boundary penalty
             "or": 8.0 * max(0.0, p - 0.4) ** 2,  # late-phase orient snap
             "dc": 10.0,
+            "bin": 50.0 * p**2,  # ramp up layer binarization
         }
 
         opt.zero_grad()
@@ -473,6 +510,7 @@ def run_gpu_placement(
         print("\n--- Phase 3: Refinement (frozen theta) ---")
 
     model.Theta.requires_grad_(False)
+    model.Z_logits.requires_grad_(False)
     opt2 = torch.optim.AdamW([model.X, model.Y], lr=lr * 0.5)
 
     refine_iters = 400
@@ -485,6 +523,7 @@ def run_gpu_placement(
             "bd": 500.0,
             "or": 0.0,
             "dc": 15.0,
+            "bin": 0.0,  # already frozen
         }
         opt2.zero_grad()
         loss, m = model(w)
@@ -501,6 +540,7 @@ def run_gpu_placement(
             )
 
     model.Theta.requires_grad_(True)
+    model.Z_logits.requires_grad_(True)
 
     # ── Write optimized positions back to Component objects ────────
     with torch.no_grad():
@@ -510,12 +550,18 @@ def run_gpu_placement(
                     [model.X[i].item(), model.Y[i].item()]
                 )
                 components[cid].theta = model.Theta[i].item()
+                # Assign layer based on final Z probability
+                z_prob = torch.sigmoid(model.Z_logits[i]).item()
+                components[cid].layer = "F.Cu" if z_prob >= 0.5 else "B.Cu"
 
+    n_top = sum(1 for c in components.values() if c.layer == "F.Cu")
+    n_bot = sum(1 for c in components.values() if c.layer == "B.Cu")
     dt = time.perf_counter() - t0
     if verbose:
         print(
             f"\n[OK] Placement complete in {dt:.2f}s  "
             f"({prob.n} components, {len(prob.nets)} nets)"
         )
+        print(f"  Layer assignment: {n_top} Top (F.Cu), {n_bot} Bottom (B.Cu)")
 
     return m

@@ -55,6 +55,34 @@ def _format_sexp(node, depth: int = 0) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Layer swap mapping for footprint flipping (Top ↔ Bottom)
+# ──────────────────────────────────────────────────────────────────────
+
+_LAYER_SWAP = {
+    '"F.Cu"': '"B.Cu"', '"B.Cu"': '"F.Cu"',
+    '"F.SilkS"': '"B.SilkS"', '"B.SilkS"': '"F.SilkS"',
+    '"F.Mask"': '"B.Mask"', '"B.Mask"': '"F.Mask"',
+    '"F.Paste"': '"B.Paste"', '"B.Paste"': '"F.Paste"',
+    '"F.CrtYd"': '"B.CrtYd"', '"B.CrtYd"': '"F.CrtYd"',
+    '"F.Fab"': '"B.Fab"', '"B.Fab"': '"F.Fab"',
+    '"F.Adhes"': '"B.Adhes"', '"B.Adhes"': '"F.Adhes"',
+    '"F.Silkscreen"': '"B.Silkscreen"', '"B.Silkscreen"': '"F.Silkscreen"',
+    '"F.Courtyard"': '"B.Courtyard"', '"B.Courtyard"': '"F.Courtyard"',
+    '"F.Adhesive"': '"B.Adhesive"', '"B.Adhesive"': '"F.Adhesive"',
+}
+
+
+def _swap_layers(node) -> None:
+    """Recursively walk an S-expression node and swap F.* ↔ B.* layer names."""
+    if isinstance(node, list):
+        for i, child in enumerate(node):
+            if isinstance(child, str) and child in _LAYER_SWAP:
+                node[i] = _LAYER_SWAP[child]
+            elif isinstance(child, list):
+                _swap_layers(child)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────
 
@@ -73,13 +101,15 @@ def export_kicad_pcb(
     output_path : str
         Destination path for the placed file.
     components : dict
-        Mapping of reference → Component with optimized ``.pos`` and ``.theta``.
+        Mapping of reference → Component with optimized ``.pos``, ``.theta``,
+        and ``.layer``.
     """
     # Re-use the parser already available in main.py
     from main import parse_sexp, _find, _first, _unq
 
     root = parse_sexp(open(input_path, encoding="utf-8").read())
     updated = 0
+    flipped = 0
 
     for fp in _find(root, "footprint"):
         # ── resolve component reference ──
@@ -113,10 +143,26 @@ def export_kicad_pcb(
         elif abs(angle_deg) > 0.01:
             at.append(f"{angle_deg:.2f}")
 
+        # ── Handle layer flipping ──
+        fp_layer_node = _first(fp, "layer")
+        if fp_layer_node and len(fp_layer_node) > 1:
+            orig_layer = _unq(fp_layer_node[1])
+            new_layer = getattr(comp, "layer", orig_layer)
+            if orig_layer != new_layer:
+                # Update footprint top-level layer
+                fp_layer_node[1] = f'"{new_layer}"'
+                # Recursively swap all F.* ↔ B.* layer names in sub-nodes
+                _swap_layers(fp)
+                flipped += 1
+
         updated += 1
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(_format_sexp(root))
         f.write("\n")
 
-    print(f"[OK] Exported {updated} component positions -> {output_path}")
+    msg = f"[OK] Exported {updated} component positions -> {output_path}"
+    if flipped:
+        msg += f" ({flipped} flipped to opposite layer)"
+    print(msg)
+

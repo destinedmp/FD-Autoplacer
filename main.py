@@ -33,6 +33,7 @@ class Component:
     half_size: np.ndarray = field(default_factory=lambda: np.array([2.5, 2.5]))
     pins: list = field(default_factory=list)
     fixed: bool = False
+    layer: str = "F.Cu"
     allowed_rect: tuple | None = None
     allowed_polygon: np.ndarray | None = None
     allowed_orientations: list | None = None
@@ -293,18 +294,29 @@ def draw(components, board, ax, title):
     for cid, c in components.items():
         box = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]]) * c.half_size
         corners = (rot(c.theta) @ box.T).T + c.pos
-        color = "#fcc" if cid.startswith("J_") else "#cce"
+        is_bottom = getattr(c, "layer", "F.Cu") == "B.Cu"
+        if is_bottom:
+            color = "#fdd"  # red tint for bottom layer
+            edge_color = "#822"
+        elif cid.startswith("J_"):
+            color = "#fcc"
+            edge_color = "#225"
+        else:
+            color = "#cce"
+            edge_color = "#225"
         ax.add_patch(
             patches.Polygon(
-                corners, facecolor=color, edgecolor="#225", linewidth=1.0, zorder=2
+                corners, facecolor=color, edgecolor=edge_color, linewidth=1.0, zorder=2,
+                linestyle="--" if is_bottom else "-",
             )
         )
         ax.text(
-            c.pos[0], c.pos[1], cid, ha="center", va="center", fontsize=6.5, zorder=3
+            c.pos[0], c.pos[1], cid, ha="center", va="center", fontsize=6.5, zorder=3,
+            color="#822" if is_bottom else "#000",
         )
         for p in c.pins:
             wp = pin_world(c, p)
-            ax.plot(wp[0], wp[1], "o", color="#225", markersize=1.8, zorder=3)
+            ax.plot(wp[0], wp[1], "o", color="#822" if is_bottom else "#225", markersize=1.8, zorder=3)
 
 
 # ---------- KiCad PCB import ----------
@@ -415,6 +427,10 @@ def import_kicad_pcb(path):
         fx, fy = float(at[1]), -float(at[2])
         ftheta = np.radians(float(at[3])) if len(at) > 3 else 0.0
 
+        # Parse footprint layer (F.Cu or B.Cu)
+        fp_layer_node = _first(fp, "layer")
+        fp_layer = _unq(fp_layer_node[1]) if fp_layer_node and len(fp_layer_node) > 1 else "F.Cu"
+
         pins, xs, ys = [], [], []
         for pad in _find(fp, "pad"):
             pa = _first(pad, "at")
@@ -435,6 +451,7 @@ def import_kicad_pcb(path):
             theta=ftheta,
             half_size=np.array([hw, hh]),
             pins=pins,
+            layer=fp_layer,
             allowed_orientations=QUAD,
         )
 
