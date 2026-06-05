@@ -1,6 +1,3 @@
-
-![animation](fd-ap.gif)
-
 # FD-Autoplacer
 
 **A GPU-accelerated, force-directed PCB component autoplacer for KiCad 6+ boards.**
