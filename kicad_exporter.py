@@ -105,7 +105,7 @@ def export_kicad_pcb(
         and ``.layer``.
     """
     # Re-use the parser already available in main.py
-    from main import parse_sexp, _find, _first, _unq
+    from parser import parse_sexp, _find, _first, _unq
 
     root = parse_sexp(open(input_path, encoding="utf-8").read())
     updated = 0
