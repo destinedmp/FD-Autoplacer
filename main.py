@@ -86,6 +86,9 @@ def project_position(comp: Component) -> None:
     Push a component back inside the board polygon if it has drifted outside.
     The GPU optimizer uses a soft boundary penalty during training; this does
     a final hard correction pass afterwards.
+
+    Loops up to 6 times because one pass may push the centre back in but leave
+    corners still outside — iterating converges to a fully-contained position.
     """
     poly = comp.allowed_polygon
     if poly is None:
@@ -93,17 +96,22 @@ def project_position(comp: Component) -> None:
     if not point_in_polygon(comp.pos, poly):
         comp.pos = closest_on_polygon(comp.pos, poly)
     hs = comp.half_size
-    corners = comp.pos + np.array([[-hs[0], -hs[1]], [hs[0], -hs[1]],
-                                    [hs[0], hs[1]], [-hs[0], hs[1]]])
-    push = np.zeros(2)
-    for corner in corners:
-        if not point_in_polygon(corner, poly):
-            d = closest_on_polygon(corner, poly) - corner
-            if abs(d[0]) > abs(push[0]):
-                push[0] = d[0]
-            if abs(d[1]) > abs(push[1]):
-                push[1] = d[1]
-    comp.pos = comp.pos + push
+    for _ in range(6):
+        corners = comp.pos + np.array([[-hs[0], -hs[1]], [hs[0], -hs[1]],
+                                        [hs[0], hs[1]], [-hs[0], hs[1]]])
+        push = np.zeros(2)
+        moved = False
+        for corner in corners:
+            if not point_in_polygon(corner, poly):
+                d = closest_on_polygon(corner, poly) - corner
+                if abs(d[0]) > abs(push[0]):
+                    push[0] = d[0]
+                if abs(d[1]) > abs(push[1]):
+                    push[1] = d[1]
+                moved = True
+        if not moved:
+            break
+        comp.pos = comp.pos + push
 
 
 # ── Pin swap (Hungarian algorithm) ───────────────────────────────────
@@ -175,7 +183,17 @@ if __name__ == "__main__":
         for c in components.values():
             c.allowed_polygon = board
 
-    swap_groups = [SwapGroup(cid, [0, 1]) for cid in ("R1", "R2") if cid in components]
+    # Auto-detect all symmetric 2-pin passives (resistors, caps, diodes,
+    # ferrite beads, inductors) — their two pins are physically interchangeable.
+    SYMMETRIC_PREFIXES = ("R", "C", "D", "FB", "L", "F")
+    swap_groups = [
+        SwapGroup(cid, [0, 1])
+        for cid, comp in components.items()
+        if cid.upper().startswith(SYMMETRIC_PREFIXES)
+        and len(comp.pins) == 2
+        and not comp.fixed
+    ]
+    print(f"  Pin-swap groups: {len(swap_groups)} symmetric 2-pin passives")
 
     # ── Scramble starting positions ──
     xs, ys = board[:, 0], board[:, 1]
