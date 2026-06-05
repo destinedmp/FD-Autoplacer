@@ -84,9 +84,8 @@ def footprint(ref: str, val: str, kicad_x: float, kicad_y: float,
     """Build a footprint S-expression block."""
     at = f"{kicad_x:.3f} {kicad_y:.3f}" + (f" {theta:.1f}" if theta else "")
     lines = [
-        f'  (footprint "Demo:{ref}" layer "{layer}"',
+        f'  (footprint "Demo:{ref}" (layer "{layer}")',
         f'    (at {at})',
-        f'    (layer "{layer}")',
     ]
     lines += _fp_text(ref, val)
     lines += pads
