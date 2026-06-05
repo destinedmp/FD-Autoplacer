@@ -131,3 +131,4 @@ dmypy.json
 # Project generated outputs
 placement.png
 tests/*_placed*.kicad_pcb
+tests/demo_two_layer.kicad_pcb
