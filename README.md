@@ -22,16 +22,15 @@ This is a significant step up from classic force-directed placement: instead of 
 ## Architecture
 
 ```
-main.py              Entry point, KiCad parser, legacy FD solver, visualization
+main.py              Entry point, KiCad parser, visualization
 optim_engine.py      GPU/CPU differentiable placement engine (PyTorch)
 kicad_exporter.py    S-expression writer — exports placed file back to KiCad
-legacy/              Original interactive visualizer (tkinter, pre-rewrite)
 tests/               Sample .kicad_pcb boards
 ```
 
-### `main.py` — Parser & Legacy Solver
+### `main.py` — Parser & Optimization Driver
 
-Contains three layers:
+Contains two core parts:
 
 1. **KiCad 6+ S-expression parser** (`parse_sexp`, `import_kicad_pcb`)
    - Parses `footprint`, `pad`, `net`, `fp_text`, `gr_line`, `gr_arc`, `gr_rect` nodes
@@ -39,15 +38,9 @@ Contains three layers:
    - Reconstructs the `Edge.Cuts` board boundary into a polygon using segment chaining
    - Negates the Y axis on read (KiCad uses Y-down; internally Y-up is used throughout)
 
-2. **Legacy force-directed solver** (`run`, `attractive`, `repulsive`)
-   - Overdamped Euler integration of per-net spring forces applied at pin world positions (generating both translational force and torque)
-   - AABB repulsion between all component pairs
-   - Periodic Hungarian pin-swap optimization (`scipy.optimize.linear_sum_assignment`) to re-assign equivalent pins to reduce total wirelength
-   - Soft orientation snapping toward 0°/90°/180°/270° with a strength that ramps over time
-   - Polygon constraint projection after each step
-
-3. **Visualization** (`draw`)
+2. **Visualization & Utilities** (`draw`, `optimize_swap_group`)
    - matplotlib rendering of board polygon, net ratsnest lines, component boxes, and pin locations
+   - Hungarian algorithm pin-swap optimization (`scipy.optimize.linear_sum_assignment`) to re-assign equivalent symmetric pins to reduce total wirelength after spatial placement
 
 ### `optim_engine.py` — GPU Optimization Engine
 
@@ -138,9 +131,6 @@ python main.py path/to/board.kicad_pcb --export path/to/board_placed.kicad_pcb
 
 # Keep original positions (don't scramble before placing)
 python main.py path/to/board.kicad_pcb --no-scramble
-
-# Use the legacy force-directed solver
-python main.py path/to/board.kicad_pcb --legacy
 ```
 
 All runs save a `placement.png` side-by-side comparison of the initial and converged layouts.
@@ -150,7 +140,6 @@ All runs save a `placement.png` side-by-side comparison of the initial and conve
 | Flag | Default | Description |
 |------|---------|-------------|
 | `pcb` | `tests/simple.kicad_pcb` | Path to input `.kicad_pcb` file |
-| `--legacy` | off | Use original force-directed solver instead of GPU optimizer |
 | `--cpu` | off | Force CPU even when CUDA is available |
 | `--iters N` | 1500 | Global placement iterations |
 | `--lr F` | 0.05 | AdamW learning rate |
@@ -182,11 +171,6 @@ On `tests/leds.kicad_pcb` (99 components, 51 nets, complex cross-shaped board ou
 | Component keep-in zone | Per-component `allowed_rect` or `allowed_polygon` |
 | Pin swapping | Hungarian assignment on equivalent-pin swap groups after placement |
 
----
-
-## Legacy Visualizer
-
-The `legacy/` directory contains the original interactive tkinter-based visualizer that was the first version of this project. It reads `.kicad_pcb` files using a custom S-expression parser and renders a live force-directed simulation you can interact with. It is not integrated with the new optimizer.
 
 ---
 

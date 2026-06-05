@@ -2,7 +2,7 @@
 main.py — Entry point for the FD-Autoplacer.
 
 Usage:
-    python main.py <board.kicad_pcb> [--export output.kicad_pcb] [--legacy] [--cpu]
+    python main.py <board.kicad_pcb> [--export output.kicad_pcb] [--cpu]
 
 Flow:
     1. Parse the .kicad_pcb file  →  dict of Component objects + board polygon
@@ -78,7 +78,7 @@ def draw(components: dict, board: np.ndarray, ax, title: str) -> None:
                     markersize=1.8, zorder=3)
 
 
-# ── Boundary projection (used after GPU placement and in --legacy mode) ─
+# ── Boundary projection (used after GPU placement) ────────────────────
 
 
 def project_position(comp: Component) -> None:
@@ -154,8 +154,6 @@ if __name__ == "__main__":
     )
     ap.add_argument("pcb", nargs="?", default=os.path.join("tests", "simple.kicad_pcb"),
                     help="Path to .kicad_pcb file")
-    ap.add_argument("--legacy", action="store_true",
-                    help="Use the classic force-directed solver (CPU, no GPU)")
     ap.add_argument("--cpu", action="store_true",
                     help="Force CPU even when CUDA is available")
     ap.add_argument("--iters", type=int, default=1500,
@@ -212,25 +210,18 @@ if __name__ == "__main__":
     draw(components, board, axes[0], "Initial (Scrambled)")
 
     # ── Run optimizer ──
-    if args.legacy:
-        # Classic force-directed solver (kept for comparison / fallback)
-        from legacy_fd import run as run_legacy
-        print("Running legacy force-directed solver…")
-        run_legacy(components, swap_groups, n_iters=800)
-        title = "Converged (Legacy FD)"
-    else:
-        from optim_engine import run_gpu_placement
-        device = "cpu" if args.cpu else "cuda"
-        run_gpu_placement(components, board, n_iters=args.iters, lr=args.lr, device=device)
-        # Hard-project any components that drifted just outside the polygon
-        for comp in components.values():
-            if not comp.fixed:
-                project_position(comp)
-        # Discrete pin-swap pass (not handled by the continuous optimizer)
-        nets = rebuild_nets(components)
-        for g in swap_groups:
-            optimize_swap_group(components, nets, g)
-        title = "Converged (GPU Optimized)"
+    from optim_engine import run_gpu_placement
+    device = "cpu" if args.cpu else "cuda"
+    run_gpu_placement(components, board, n_iters=args.iters, lr=args.lr, device=device)
+    # Hard-project any components that drifted just outside the polygon
+    for comp in components.values():
+        if not comp.fixed:
+            project_position(comp)
+    # Discrete pin-swap pass (not handled by the continuous optimizer)
+    nets = rebuild_nets(components)
+    for g in swap_groups:
+        optimize_swap_group(components, nets, g)
+    title = "Converged (GPU Optimized)"
 
     # ── After snapshot + save ──
     draw(components, board, axes[1], title)
